@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-import asyncio, base64, io, json, os, re, threading, time, uuid
+import base64, io, json, os, re, subprocess, sys, threading, time, traceback, uuid
 from pathlib import Path
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from PIL import Image, ImageOps
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 app = Flask(__name__)
 CORS(app)
@@ -20,9 +19,28 @@ DEFAULT_EMAIL     = "checkin@automatico.com"
 DEFAULT_NATION    = "Brasil"
 DEFAULT_GENDER    = "M"
 DEFAULT_BIRTHDATE = "01/01/1980"
-DEFAULT_PREFER_NO_EMERGENCY = True
 
-JS_LOAD_H2C = """async () => {
+# ─── Script Playwright que roda em processo separado ──────────────────────────
+# Isto evita o conflito asyncio/gunicorn/threading
+PLAYWRIGHT_SCRIPT = """
+import asyncio, base64, io, json, os, re, sys, time, traceback
+from pathlib import Path
+from PIL import Image, ImageOps
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+
+DEFAULT_CPF   = "38099424050"
+DEFAULT_PHONE = "68992297125"
+DEFAULT_EMAIL = "checkin@automatico.com"
+DEFAULT_NATION = "Brasil"
+DEFAULT_GENDER = "M"
+DEFAULT_BIRTHDATE = "01/01/1980"
+
+def log(msg):
+    ts = time.strftime('%H:%M:%S')
+    line = f'[{ts}] {msg}'
+    print(line, flush=True)
+
+JS_LOAD_H2C = \"\"\"async () => {
 if (typeof html2canvas !== 'undefined') return 'ok';
 await new Promise((res, rej) => {
 const s = document.createElement('script');
@@ -31,9 +49,9 @@ s.onload = res; s.onerror = rej;
 document.head.appendChild(s);
 });
 return 'loaded';
-}"""
+}\"\"\"
 
-JS_CAPTURE = """async (idx, scale) => {
+JS_CAPTURE = \"\"\"async (idx, scale) => {
 const cards = document.querySelectorAll('.details-boarding-card');
 if (!cards[idx]) return null;
 cards[idx].scrollIntoView({ behavior: 'instant', block: 'start' });
@@ -43,411 +61,354 @@ scale, useCORS: true, allowTaint: true,
 backgroundColor: '#ffffff', logging: false
 });
 return c.toDataURL('image/png');
-}"""
+}\"\"\"
 
 JS_CARD_COUNT = "() => document.querySelectorAll('.details-boarding-card').length"
 
-JS_CONTINUAR = """() => {
+JS_CONTINUAR = \"\"\"() => {
 const btns = Array.from(document.querySelectorAll('button'));
 const b = btns.find(b => b.textContent.trim().toLowerCase() === 'continuar' && !b.disabled);
 if (b) { b.click(); return true; }
 const o = document.querySelector('.a-btn--orange:not([disabled])');
 if (o) { o.click(); return true; }
 return false;
-}"""
+}\"\"\"
 
-JS_ROUTE = """(idx) => {
+JS_ROUTE = \"\"\"(idx) => {
 const c = document.querySelectorAll('.details-boarding-card')[idx];
 if (!c) return 'TRECHO' + (idx+1);
 const stub = c.querySelector('b2c-boarding-card-stub, article');
 if (stub) {
-const m = stub.textContent.match(/([A-Z]{3})[\\s\\S]{0,5}([A-Z]{3})/);
+const m = stub.textContent.match(/([A-Z]{3})[\\\\s\\\\S]{0,5}([A-Z]{3})/);
 if (m && m[1] !== m[2]) return m[1] + '-' + m[2];
 }
 return 'TRECHO' + (idx+1);
-}"""
+}\"\"\"
 
+def add_border(b64, px=25):
+    if ',' in b64:
+        b64 = b64.split(',', 1)[1]
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGBA')
+    bordered = ImageOps.expand(img, border=px, fill=(255, 255, 255, 255))
+    buf = io.BytesIO()
+    bordered.save(buf, format='PNG', optimize=True)
+    return buf.getvalue()
 
-def _apply_defaults(pax):
-    pax.setdefault('cpf', DEFAULT_CPF)
-    pax.setdefault('phone', DEFAULT_PHONE)
-    pax.setdefault('country_code', DEFAULT_COUNTRY)
-    pax.setdefault('email', DEFAULT_EMAIL)
-    pax.setdefault('nationality', DEFAULT_NATION)
-    pax.setdefault('gender', DEFAULT_GENDER)
-    pax.setdefault('birth_date', DEFAULT_BIRTHDATE)
-    pax.setdefault('prefer_no_emergency', DEFAULT_PREFER_NO_EMERGENCY)
-    return pax
-
-
-class GolCheckinEngine:
-    def __init__(self, payload, job_id):
-        self.record_locator    = payload['record_locator']
-        self.departure_airport = payload['departure_airport']
-        raw_pax = payload.get('passengers', [{}])
-        self.passengers = [_apply_defaults(dict(p)) for p in raw_pax]
-        self.job_id   = job_id
-        self.job_dir  = OUTPUT_DIR / job_id
-        self.job_dir.mkdir(parents=True, exist_ok=True)
-        self.border_px = payload.get('border_px', 25)
-
-    def _log(self, msg):
-        ts   = time.strftime('%H:%M:%S')
-        line = f'[{ts}] {msg}'
-        print(line, flush=True)
-        JOBS[self.job_id]['logs'].append(line)
-
-    async def _wait(self, ms=1000):
-        await asyncio.sleep(ms / 1000)
-
-    def _add_border(self, b64):
-        if ',' in b64:
-            b64 = b64.split(',', 1)[1]
-        img      = Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGBA')
-        bordered = ImageOps.expand(img, border=self.border_px, fill=(255, 255, 255, 255))
-        buf = io.BytesIO()
-        bordered.save(buf, format='PNG', optimize=True)
-        return buf.getvalue()
-
-    async def _click_continuar(self, page, attempts=4):
-        for _ in range(attempts):
-            try:
-                await page.wait_for_selector(
-                    "button:has-text('Continuar'):not([disabled])",
-                    state='visible', timeout=10_000)
-                await page.click("button:has-text('Continuar'):not([disabled])")
-                self._log(' -> Continuar clicado')
-                await self._wait(1500)
-                return
-            except Exception:
-                ok = await page.evaluate(JS_CONTINUAR)
-                if ok:
-                    self._log(' -> Continuar via JS')
-                    await self._wait(1500)
-                    return
-            await self._wait(2000)
-
-    async def _fill_pax(self, page, pax):
-        name = (pax.get('first_name', '') + ' ' + pax.get('last_name', '')).strip()
-        self._log(f'Preenchendo passageiro: {name or "sem nome"}')
-        found = False
-        try:
-            btns = await page.query_selector_all('button, a')
-            for btn in btns:
-                txt = (await btn.inner_text()).strip().lower()
-                if 'preencher dados' in txt or 'completar dados' in txt:
-                    await btn.click()
-                    found = True
-                    await self._wait(2500)
-                    self._log('  Botao preencher clicado')
-                    break
-        except Exception as e:
-            self._log(f'  Aviso botao: {e}')
-
-        if not found:
-            self._log('  Sem botao de preencher, continuando...')
-            return
-
-        # Passo 1
-        self._log('  Passo 1: dados pessoais')
+async def click_continuar(page):
+    for _ in range(4):
         try:
             await page.wait_for_selector(
-                'input[placeholder*="CPF"], input[name*="cpf"], input[id*="cpf"]',
-                timeout=10000)
-            cpf_raw = re.sub(r'\D', '', pax.get('cpf', DEFAULT_CPF))
-            cpf_fmt = f"{cpf_raw[:3]}.{cpf_raw[3:6]}.{cpf_raw[6:9]}-{cpf_raw[9:]}"
-            cpf_field = await page.query_selector(
-                'input[placeholder*="CPF"], input[name*="cpf"], input[id*="cpf"]')
-            if cpf_field:
-                await cpf_field.triple_click()
-                await cpf_field.type(cpf_fmt, delay=60)
-                self._log(f'  CPF: {cpf_fmt}')
-        except Exception as e:
-            self._log(f'  CPF erro: {e}')
-
-        try:
-            nat_sel = await page.query_selector(
-                'select[name*="national"], select[id*="national"], select[formcontrolname*="national"]')
-            if nat_sel:
-                await nat_sel.select_option(label=pax.get('nationality', DEFAULT_NATION))
-                self._log('  Nacionalidade selecionada')
+                "button:has-text('Continuar'):not([disabled])",
+                state='visible', timeout=10000)
+            await page.click("button:has-text('Continuar'):not([disabled])")
+            log(' -> Continuar')
+            await asyncio.sleep(1.5)
+            return
         except Exception:
-            pass
+            ok = await page.evaluate(JS_CONTINUAR)
+            if ok:
+                log(' -> Continuar JS')
+                await asyncio.sleep(1.5)
+                return
+        await asyncio.sleep(2)
 
+async def fill_pax(page, pax):
+    log(f'Passageiro: {pax.get("first_name","")} {pax.get("last_name","")}')
+    found = False
+    try:
+        btns = await page.query_selector_all('button, a')
+        for btn in btns:
+            txt = (await btn.inner_text()).strip().lower()
+            if 'preencher dados' in txt or 'completar dados' in txt:
+                await btn.click()
+                found = True
+                await asyncio.sleep(2.5)
+                log('  Botao preencher clicado')
+                break
+    except Exception as e:
+        log(f'  Aviso botao: {e}')
+    if not found:
+        log('  Sem botao preencher, pulando')
+        return
+
+    log('  Passo 1: dados pessoais')
+    try:
+        await page.wait_for_selector(
+            'input[placeholder*="CPF"], input[name*="cpf"], input[id*="cpf"]',
+            timeout=10000)
+        cpf_raw = re.sub(r'\\D', '', pax.get('cpf', DEFAULT_CPF))
+        cpf_fmt = f'{cpf_raw[:3]}.{cpf_raw[3:6]}.{cpf_raw[6:9]}-{cpf_raw[9:]}'
+        cpf_field = await page.query_selector(
+            'input[placeholder*="CPF"], input[name*="cpf"], input[id*="cpf"]')
+        if cpf_field:
+            await cpf_field.triple_click()
+            await cpf_field.type(cpf_fmt, delay=60)
+            log(f'  CPF: {cpf_fmt}')
+    except Exception as e:
+        log(f'  CPF erro: {e}')
+    try:
+        nat = await page.query_selector(
+            'select[name*="national"], select[id*="national"]')
+        if nat:
+            await nat.select_option(label=pax.get('nationality', DEFAULT_NATION))
+    except Exception: pass
+    try:
+        bd = await page.query_selector(
+            'input[placeholder*="nasc"], input[name*="birth"]')
+        if bd:
+            await bd.triple_click()
+            await bd.type(pax.get('birth_date', DEFAULT_BIRTHDATE), delay=60)
+    except Exception: pass
+    try:
+        gen = pax.get('gender', DEFAULT_GENDER).upper()
+        g = await page.query_selector(f'input[value="{gen}"]')
+        if g: await g.click()
+    except Exception: pass
+    await click_continuar(page)
+
+    log('  Passo 2: contato')
+    try:
+        ef = await page.query_selector('input[type="email"], input[name*="email"]')
+        if ef:
+            await ef.triple_click()
+            await ef.type(pax.get('email', DEFAULT_EMAIL), delay=60)
+    except Exception: pass
+    try:
+        ph_raw = re.sub(r'\\D', '', pax.get('phone', DEFAULT_PHONE))
+        ddd = ph_raw[:2]; num = ph_raw[2:]
+        pf = await page.query_selector('input[placeholder*="celular"], input[name*="phone"]')
+        if pf:
+            await pf.triple_click()
+            await pf.type(f'({ddd}) {num[:5]}-{num[5:]}', delay=60)
+    except Exception: pass
+    try:
+        tg = await page.query_selector(
+            'label:has-text("emergencia"), label:has-text("emergência"), input[type="checkbox"]')
+        if tg:
+            await tg.click()
+    except Exception: pass
+    await click_continuar(page)
+
+    log('  Passo 3: milhas (pular)')
+    await click_continuar(page)
+
+async def main():
+    payload = json.loads(sys.argv[1])
+    job_dir = Path(sys.argv[2])
+    job_dir.mkdir(parents=True, exist_ok=True)
+    result = {'status': 'error', 'files': [], 'logs': [], 'error': None}
+
+    def l(msg):
+        ts = time.strftime('%H:%M:%S')
+        line = f'[{ts}] {msg}'
+        print(line, flush=True)
+        result['logs'].append(line)
+
+    l('=== INICIANDO CHECK-IN GOL ===')
+    l(f'Localizador: {payload["record_locator"]} | Origem: {payload["departure_airport"]}')
+    url = (f'https://b2c.voegol.com.br/check-in'
+           f'?recordLocator={payload["record_locator"]}'
+           f'&departureAirport={payload["departure_airport"]}')
+
+    pax_list = payload.get('passengers', [{}])
+    for p in pax_list:
+        p.setdefault('cpf', DEFAULT_CPF)
+        p.setdefault('phone', DEFAULT_PHONE)
+        p.setdefault('email', DEFAULT_EMAIL)
+        p.setdefault('nationality', DEFAULT_NATION)
+        p.setdefault('gender', DEFAULT_GENDER)
+        p.setdefault('birth_date', DEFAULT_BIRTHDATE)
+        p.setdefault('prefer_no_emergency', True)
+
+    l('Iniciando Playwright...')
+    async with async_playwright() as pw:
+        l('Abrindo Chromium...')
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=['--no-sandbox','--disable-setuid-sandbox',
+                  '--disable-dev-shm-usage','--disable-gpu',
+                  '--single-process','--no-zygote',
+                  '--disable-blink-features=AutomationControlled'])
+        l('Chromium aberto!')
+        ctx = await browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            viewport={'width':1280,'height':800}, locale='pt-BR')
+        page = await ctx.new_page()
+        l('Pagina criada. Navegando...')
         try:
-            bd_field = await page.query_selector(
-                'input[placeholder*="nasc"], input[name*="birth"], input[id*="birth"]')
-            if bd_field:
-                await bd_field.triple_click()
-                await bd_field.type(pax.get('birth_date', DEFAULT_BIRTHDATE), delay=60)
-                self._log('  Data nascimento preenchida')
-        except Exception:
-            pass
-
-        try:
-            gen = pax.get('gender', DEFAULT_GENDER).upper()
-            gen_sel = await page.query_selector(f'input[value="{gen}"]')
-            if gen_sel:
-                await gen_sel.click()
-                self._log('  Genero selecionado')
-        except Exception:
-            pass
-
-        await self._click_continuar(page)
-
-        # Passo 2
-        self._log('  Passo 2: contato')
-        try:
-            email_field = await page.query_selector(
-                'input[type="email"], input[name*="email"], input[id*="email"]')
-            if email_field:
-                await email_field.triple_click()
-                await email_field.type(pax.get('email', DEFAULT_EMAIL), delay=60)
-                self._log('  Email preenchido')
-        except Exception:
-            pass
-
-        try:
-            phone_raw = re.sub(r'\D', '', pax.get('phone', DEFAULT_PHONE))
-            ddd = phone_raw[:2]
-            num = phone_raw[2:]
-            ph_field = await page.query_selector(
-                'input[placeholder*="celular"], input[name*="phone"], input[id*="phone"]')
-            if ph_field:
-                await ph_field.triple_click()
-                await ph_field.type(f"({ddd}) {num[:5]}-{num[5:]}", delay=60)
-                self._log('  Telefone preenchido')
-        except Exception:
-            pass
-
-        if pax.get('prefer_no_emergency', DEFAULT_PREFER_NO_EMERGENCY):
             try:
-                toggle = await page.query_selector(
-                    'label:has-text("emergencia"), label:has-text("emergência"), '
-                    'input[type="checkbox"]')
-                if toggle:
-                    await toggle.click()
-                    await self._wait(500)
-                    self._log('  Toggle emergencia clicado')
-            except Exception:
-                pass
-
-        await self._click_continuar(page)
-
-        # Passo 3
-        self._log('  Passo 3: milhas (pular)')
-        await self._click_continuar(page)
-
-    async def run(self):
-        self._log('=== INICIANDO CHECK-IN GOL ===')
-        self._log(f'Localizador: {self.record_locator} | Origem: {self.departure_airport}')
-        url = (f'https://b2c.voegol.com.br/check-in'
-               f'?recordLocator={self.record_locator}'
-               f'&departureAirport={self.departure_airport}')
-        self._log(f'URL: {url}')
-
-        self._log('Iniciando Playwright...')
-        async with async_playwright() as pw:
-            self._log('Playwright iniciado. Abrindo Chromium...')
-            browser = await pw.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox',
-                      '--disable-blink-features=AutomationControlled',
-                      '--disable-dev-shm-usage', '--disable-gpu',
-                      '--disable-extensions', '--single-process'])
-            self._log('Chromium aberto. Criando contexto...')
-            ctx = await browser.new_context(
-                user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                            'AppleWebKit/537.36 (KHTML, like Gecko) '
-                            'Chrome/124.0.0.0 Safari/537.36'),
-                viewport={'width': 1280, 'height': 800},
-                locale='pt-BR')
-            self._log('Contexto criado. Abrindo pagina...')
-            page = await ctx.new_page()
-            self._log('Pagina aberta. Navegando para GOL...')
-
-            try:
-                # goto com timeout curto — nao usar networkidle
-                try:
-                    await page.goto(url, wait_until='commit', timeout=30000)
-                    self._log('goto commit OK')
-                except PWTimeout:
-                    self._log('goto timeout (commit), continuando mesmo assim')
-                except Exception as e:
-                    self._log(f'goto erro: {e}, continuando mesmo assim')
-
-                self._log('Aguardando pagina renderizar (6s)...')
-                await self._wait(6000)
-                self._log(f'URL atual: {page.url}')
-
-                # Verificar se carregou algo util
-                title = await page.title()
-                self._log(f'Titulo da pagina: {title}')
-
-                # Tentar load state para garantir que DOM carregou
-                try:
-                    await page.wait_for_load_state('domcontentloaded', timeout=15000)
-                    self._log('DOM carregado')
-                except Exception as e:
-                    self._log(f'wait_for_load_state: {e}')
-
-                await self._wait(3000)
-                self._log('Procurando elementos na pagina...')
-
-                # Verificar quantos botoes tem
-                btns = await page.query_selector_all('button')
-                self._log(f'Botoes encontrados: {len(btns)}')
-
-                # Aceitar cookies
-                try:
-                    await page.click(
-                        "button:has-text('Aceitar'), button:has-text('Concordo')",
-                        timeout=5000)
-                    await self._wait(1000)
-                    self._log('Cookies aceitos')
-                except Exception:
-                    self._log('Sem banner de cookies')
-
-                # Clicar em Completar dados
-                self._log('Procurando botao de inicio...')
-                clicked = False
-                for sel in [
-                    "button:has-text('Completar dados')",
-                    "button:has-text('Iniciar check-in')",
-                    "button:has-text('Continuar')",
-                    "button:has-text('Check-in')"]:
-                    try:
-                        await page.click(sel, timeout=6000)
-                        await self._wait(2000)
-                        self._log(f'Clicou: {sel}')
-                        clicked = True
-                        break
-                    except Exception:
-                        pass
-
-                if not clicked:
-                    self._log('AVISO: Nenhum botao de inicio encontrado')
-                    # Log todos os botoes visiveis
-                    btns = await page.query_selector_all('button')
-                    for b in btns[:10]:
-                        try:
-                            txt = await b.inner_text()
-                            self._log(f'  Botao: "{txt.strip()[:50]}"')
-                        except Exception:
-                            pass
-
-                # Preencher passageiros
-                pax_list = self.passengers if self.passengers else [_apply_defaults({})]
-                for i, pax in enumerate(pax_list):
-                    self._log(f'-- Passageiro {i+1}/{len(pax_list)} --')
-                    await self._fill_pax(page, pax)
-                    await self._wait(2000)
-
-                # Confirmar bagagens
-                self._log('Confirmando bagagens...')
-                try:
-                    chk = await page.query_selector('input[type="checkbox"]')
-                    if chk:
-                        await chk.click()
-                        await self._wait(500)
-                    await self._click_continuar(page)
-                except Exception:
-                    pass
-
-                # Ancilares
-                self._log('Confirmando ancilares...')
-                try:
-                    await self._click_continuar(page)
-                except Exception:
-                    pass
-
-                # Assentos
-                self._log('Confirmando assentos...')
-                try:
-                    await self._click_continuar(page)
-                except Exception:
-                    pass
-
-                # Aguardar cartoes de embarque
-                self._log('Aguardando cartoes de embarque...')
-                try:
-                    await page.wait_for_url(
-                        '**/cartao-de-embarque**',
-                        wait_until='commit',
-                        timeout=90000)
-                    self._log('Chegou na pagina de cartoes!')
-                except Exception as e:
-                    self._log(f'wait_for_url cartao: {e}')
-
-                await self._wait(5000)
-                self._log(f'URL final: {page.url}')
-
-                # Carregar html2canvas
-                self._log('Carregando html2canvas...')
-                await page.evaluate(JS_LOAD_H2C)
-                await self._wait(2000)
-
-                # Detectar passageiros
-                pax_tabs = await page.query_selector_all(
-                    '.p-boarding-pass__details-item, [class*="passenger-tab"]')
-                n_pax = max(len(pax_tabs), 1)
-                self._log(f'Abas de passageiros: {n_pax}')
-
-                card_count = await page.evaluate(JS_CARD_COUNT)
-                self._log(f'Cartoes detectados: {card_count}')
-
-                files = []
-                for pi in range(n_pax):
-                    if pi > 0 and pi < len(pax_tabs):
-                        try:
-                            await pax_tabs[pi].click()
-                            await self._wait(2000)
-                        except Exception:
-                            pass
-
-                    pax_name = f'PAX{pi+1}'
-                    try:
-                        pax_els = await page.query_selector_all(
-                            '.p-boarding-pass__details-item')
-                        if pax_els and pi < len(pax_els):
-                            nm = await pax_els[pi].inner_text()
-                            pax_name = re.sub(r'\s+', '_',
-                                nm.strip().split('\n')[0].upper())[:20]
-                    except Exception:
-                        pass
-
-                    card_count = await page.evaluate(JS_CARD_COUNT)
-                    for ci in range(card_count):
-                        route = await page.evaluate(JS_ROUTE, ci)
-                        b64   = await page.evaluate(JS_CAPTURE, ci, 2)
-                        if not b64:
-                            continue
-                        png_bytes = self._add_border(b64)
-                        fname = f'cartao_{route}_{pax_name}.png'
-                        fpath = self.job_dir / fname
-                        fpath.write_bytes(png_bytes)
-                        files.append(fname)
-                        self._log(f'Salvo: {fname} ({len(png_bytes)//1024}KB)')
-
-                JOBS[self.job_id]['status'] = 'done'
-                JOBS[self.job_id]['files']  = files
-                self._log(f'=== CONCLUIDO! {len(files)} cartoes salvos ===')
-
+                await page.goto(url, wait_until='commit', timeout=30000)
+                l('goto OK')
             except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                self._log(f'ERRO FATAL: {e}')
-                self._log(f'TRACEBACK: {tb[:500]}')
-                JOBS[self.job_id]['status'] = 'error'
-                JOBS[self.job_id]['error']  = str(e)
-            finally:
-                await browser.close()
-                self._log('Browser fechado.')
+                l(f'goto aviso: {e}')
+            await asyncio.sleep(6)
+            l(f'URL: {page.url}')
+            l(f'Titulo: {await page.title()}')
+
+            try:
+                await page.click("button:has-text('Aceitar'), button:has-text('Concordo')", timeout=5000)
+                l('Cookies aceitos')
+            except Exception: pass
+
+            l('Procurando botao inicio...')
+            for sel in ["button:has-text('Completar dados')",
+                        "button:has-text('Iniciar check-in')",
+                        "button:has-text('Continuar')"]:
+                try:
+                    await page.click(sel, timeout=6000)
+                    await asyncio.sleep(2)
+                    l(f'Clicou: {sel}')
+                    break
+                except Exception: pass
+
+            for i, pax in enumerate(pax_list):
+                l(f'-- Passageiro {i+1} --')
+                await fill_pax(page, pax)
+                await asyncio.sleep(2)
+
+            l('Bagagens...')
+            try:
+                chk = await page.query_selector('input[type="checkbox"]')
+                if chk: await chk.click()
+                await click_continuar(page)
+            except Exception: pass
+
+            l('Ancilares...')
+            try: await click_continuar(page)
+            except Exception: pass
+
+            l('Assentos...')
+            try: await click_continuar(page)
+            except Exception: pass
+
+            l('Aguardando cartao de embarque...')
+            try:
+                await page.wait_for_url('**/cartao-de-embarque**', wait_until='commit', timeout=90000)
+                l('Chegou nos cartoes!')
+            except Exception as e:
+                l(f'Aviso cartao url: {e}')
+            await asyncio.sleep(5)
+            l(f'URL final: {page.url}')
+
+            await page.evaluate(JS_LOAD_H2C)
+            await asyncio.sleep(2)
+
+            pax_tabs = await page.query_selector_all('.p-boarding-pass__details-item')
+            n_pax = max(len(pax_tabs), 1)
+            l(f'Passageiros nas abas: {n_pax}')
+            card_count = await page.evaluate(JS_CARD_COUNT)
+            l(f'Cartoes: {card_count}')
+
+            files = []
+            for pi in range(n_pax):
+                if pi > 0 and pi < len(pax_tabs):
+                    try:
+                        await pax_tabs[pi].click()
+                        await asyncio.sleep(2)
+                    except Exception: pass
+                pax_name = f'PAX{pi+1}'
+                try:
+                    els = await page.query_selector_all('.p-boarding-pass__details-item')
+                    if els and pi < len(els):
+                        nm = await els[pi].inner_text()
+                        pax_name = re.sub(r'\\s+','_',nm.strip().split('\\n')[0].upper())[:20]
+                except Exception: pass
+                card_count = await page.evaluate(JS_CARD_COUNT)
+                for ci in range(card_count):
+                    route = await page.evaluate(JS_ROUTE, ci)
+                    b64 = await page.evaluate(JS_CAPTURE, ci, 2)
+                    if not b64: continue
+                    png = add_border(b64)
+                    fname = f'cartao_{route}_{pax_name}.png'
+                    (job_dir / fname).write_bytes(png)
+                    files.append(fname)
+                    l(f'Salvo: {fname} ({len(png)//1024}KB)')
+
+            result['status'] = 'done'
+            result['files'] = files
+            l(f'=== CONCLUIDO! {len(files)} cartoes ===')
+        except Exception as e:
+            tb = traceback.format_exc()
+            l(f'ERRO: {e}')
+            l(f'TB: {tb[:300]}')
+            result['error'] = str(e)
+        finally:
+            await browser.close()
+    print('RESULT:' + json.dumps(result), flush=True)
+
+asyncio.run(main())
+"""
+
+def _add_border(self, b64, px=25):
+    if ',' in b64:
+        b64 = b64.split(',', 1)[1]
+    img = Image.open(io.BytesIO(base64.b64decode(b64))).convert('RGBA')
+    bordered = ImageOps.expand(img, border=px, fill=(255, 255, 255, 255))
+    buf = io.BytesIO()
+    bordered.save(buf, format='PNG', optimize=True)
+    return buf.getvalue()
 
 
 def _run_job(payload, job_id):
-    engine = GolCheckinEngine(payload, job_id)
-    asyncio.run(engine.run())
+    """Roda o check-in em PROCESSO SEPARADO para evitar conflito asyncio/gunicorn."""
+    job_dir = str(OUTPUT_DIR / job_id)
+    logs = JOBS[job_id]['logs']
+
+    def _log(msg):
+        ts = time.strftime('%H:%M:%S')
+        line = f'[{ts}] {msg}'
+        print(line, flush=True)
+        logs.append(line)
+
+    _log('Iniciando check-in GOL')
+    _log(f'Localizador: {payload["record_locator"]} | Origem: {payload["departure_airport"]}')
+
+    try:
+        # Escreve o script em arquivo temporario
+        script_path = OUTPUT_DIR / f'{job_id}_script.py'
+        script_path.write_text(PLAYWRIGHT_SCRIPT)
+
+        _log('Iniciando processo Playwright...')
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path), json.dumps(payload), job_dir],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        result_line = None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line.startswith('RESULT:'):
+                result_line = line[7:]
+            else:
+                _log(line.replace('[', '').replace(']', '') if line.startswith('[') else line)
+                logs[-1] = line  # substituir com linha original formatada
+
+        proc.wait()
+        script_path.unlink(missing_ok=True)
+
+        if result_line:
+            result = json.loads(result_line)
+            JOBS[job_id]['status'] = result.get('status', 'error')
+            JOBS[job_id]['files']  = result.get('files', [])
+            JOBS[job_id]['error']  = result.get('error')
+            # Adicionar logs do subprocess ao job
+            for l in result.get('logs', []):
+                if l not in logs:
+                    logs.append(l)
+        else:
+            _log(f'Processo terminou sem resultado. Codigo: {proc.returncode}')
+            JOBS[job_id]['status'] = 'error'
+            JOBS[job_id]['error']  = f'Processo terminou sem resultado (code {proc.returncode})'
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        _log(f'ERRO no processo: {e}')
+        _log(tb[:300])
+        JOBS[job_id]['status'] = 'error'
+        JOBS[job_id]['error']  = str(e)
 
 
 @app.route('/checkin', methods=['POST'])
