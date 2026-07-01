@@ -129,7 +129,7 @@ class GolCheckinEngine:
 
     async def _fill_pax(self, page, pax):
         name = (pax.get('first_name', '') + ' ' + pax.get('last_name', '')).strip()
-        self._log(f'Preenchendo: {name or "passageiro"}')
+        self._log(f'Preenchendo passageiro: {name or "sem nome"}')
         found = False
         try:
             btns = await page.query_selector_all('button, a')
@@ -139,6 +139,7 @@ class GolCheckinEngine:
                     await btn.click()
                     found = True
                     await self._wait(2500)
+                    self._log('  Botao preencher clicado')
                     break
         except Exception as e:
             self._log(f'  Aviso botao: {e}')
@@ -147,7 +148,7 @@ class GolCheckinEngine:
             self._log('  Sem botao de preencher, continuando...')
             return
 
-        # Passo 1: dados pessoais
+        # Passo 1
         self._log('  Passo 1: dados pessoais')
         try:
             await page.wait_for_selector(
@@ -160,7 +161,7 @@ class GolCheckinEngine:
             if cpf_field:
                 await cpf_field.triple_click()
                 await cpf_field.type(cpf_fmt, delay=60)
-                self._log(f'  CPF preenchido')
+                self._log(f'  CPF: {cpf_fmt}')
         except Exception as e:
             self._log(f'  CPF erro: {e}')
 
@@ -169,6 +170,7 @@ class GolCheckinEngine:
                 'select[name*="national"], select[id*="national"], select[formcontrolname*="national"]')
             if nat_sel:
                 await nat_sel.select_option(label=pax.get('nationality', DEFAULT_NATION))
+                self._log('  Nacionalidade selecionada')
         except Exception:
             pass
 
@@ -178,6 +180,7 @@ class GolCheckinEngine:
             if bd_field:
                 await bd_field.triple_click()
                 await bd_field.type(pax.get('birth_date', DEFAULT_BIRTHDATE), delay=60)
+                self._log('  Data nascimento preenchida')
         except Exception:
             pass
 
@@ -186,12 +189,13 @@ class GolCheckinEngine:
             gen_sel = await page.query_selector(f'input[value="{gen}"]')
             if gen_sel:
                 await gen_sel.click()
+                self._log('  Genero selecionado')
         except Exception:
             pass
 
         await self._click_continuar(page)
 
-        # Passo 2: contato
+        # Passo 2
         self._log('  Passo 2: contato')
         try:
             email_field = await page.query_selector(
@@ -199,6 +203,7 @@ class GolCheckinEngine:
             if email_field:
                 await email_field.triple_click()
                 await email_field.type(pax.get('email', DEFAULT_EMAIL), delay=60)
+                self._log('  Email preenchido')
         except Exception:
             pass
 
@@ -211,6 +216,7 @@ class GolCheckinEngine:
             if ph_field:
                 await ph_field.triple_click()
                 await ph_field.type(f"({ddd}) {num[:5]}-{num[5:]}", delay=60)
+                self._log('  Telefone preenchido')
         except Exception:
             pass
 
@@ -222,48 +228,75 @@ class GolCheckinEngine:
                 if toggle:
                     await toggle.click()
                     await self._wait(500)
+                    self._log('  Toggle emergencia clicado')
             except Exception:
                 pass
 
         await self._click_continuar(page)
 
-        # Passo 3: milhas (pular)
+        # Passo 3
         self._log('  Passo 3: milhas (pular)')
         await self._click_continuar(page)
 
     async def run(self):
-        self._log('Iniciando check-in GOL')
+        self._log('=== INICIANDO CHECK-IN GOL ===')
         self._log(f'Localizador: {self.record_locator} | Origem: {self.departure_airport}')
         url = (f'https://b2c.voegol.com.br/check-in'
                f'?recordLocator={self.record_locator}'
                f'&departureAirport={self.departure_airport}')
+        self._log(f'URL: {url}')
 
+        self._log('Iniciando Playwright...')
         async with async_playwright() as pw:
+            self._log('Playwright iniciado. Abrindo Chromium...')
             browser = await pw.chromium.launch(
                 headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox',
                       '--disable-blink-features=AutomationControlled',
                       '--disable-dev-shm-usage', '--disable-gpu',
-                      '--disable-extensions'])
+                      '--disable-extensions', '--single-process'])
+            self._log('Chromium aberto. Criando contexto...')
             ctx = await browser.new_context(
                 user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                             'AppleWebKit/537.36 (KHTML, like Gecko) '
                             'Chrome/124.0.0.0 Safari/537.36'),
                 viewport={'width': 1280, 'height': 800},
                 locale='pt-BR')
+            self._log('Contexto criado. Abrindo pagina...')
             page = await ctx.new_page()
+            self._log('Pagina aberta. Navegando para GOL...')
+
             try:
-                # ── Navegar para o site da GOL ──────────────────────────────
-                # IMPORTANTE: usar 'domcontentloaded' pois o site GOL (Angular + Akamai)
-                # nunca fica totalmente quieto na rede (networkidle travaria para sempre)
-                self._log('Acessando pagina de check-in...')
+                # goto com timeout curto — nao usar networkidle
                 try:
-                    await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                    await page.goto(url, wait_until='commit', timeout=30000)
+                    self._log('goto commit OK')
                 except PWTimeout:
-                    self._log('Timeout no goto, continuando mesmo assim...')
-                # Aguardar Angular renderizar (nao usar networkidle)
-                self._log('Aguardando Angular carregar...')
+                    self._log('goto timeout (commit), continuando mesmo assim')
+                except Exception as e:
+                    self._log(f'goto erro: {e}, continuando mesmo assim')
+
+                self._log('Aguardando pagina renderizar (6s)...')
                 await self._wait(6000)
+                self._log(f'URL atual: {page.url}')
+
+                # Verificar se carregou algo util
+                title = await page.title()
+                self._log(f'Titulo da pagina: {title}')
+
+                # Tentar load state para garantir que DOM carregou
+                try:
+                    await page.wait_for_load_state('domcontentloaded', timeout=15000)
+                    self._log('DOM carregado')
+                except Exception as e:
+                    self._log(f'wait_for_load_state: {e}')
+
+                await self._wait(3000)
+                self._log('Procurando elementos na pagina...')
+
+                # Verificar quantos botoes tem
+                btns = await page.query_selector_all('button')
+                self._log(f'Botoes encontrados: {len(btns)}')
 
                 # Aceitar cookies
                 try:
@@ -273,26 +306,40 @@ class GolCheckinEngine:
                     await self._wait(1000)
                     self._log('Cookies aceitos')
                 except Exception:
-                    pass
+                    self._log('Sem banner de cookies')
 
-                # Clicar em Completar dados / Iniciar check-in
+                # Clicar em Completar dados
                 self._log('Procurando botao de inicio...')
+                clicked = False
                 for sel in [
                     "button:has-text('Completar dados')",
                     "button:has-text('Iniciar check-in')",
-                    "button:has-text('Continuar')"]:
+                    "button:has-text('Continuar')",
+                    "button:has-text('Check-in')"]:
                     try:
                         await page.click(sel, timeout=6000)
                         await self._wait(2000)
                         self._log(f'Clicou: {sel}')
+                        clicked = True
                         break
                     except Exception:
                         pass
 
-                # Preencher cada passageiro
+                if not clicked:
+                    self._log('AVISO: Nenhum botao de inicio encontrado')
+                    # Log todos os botoes visiveis
+                    btns = await page.query_selector_all('button')
+                    for b in btns[:10]:
+                        try:
+                            txt = await b.inner_text()
+                            self._log(f'  Botao: "{txt.strip()[:50]}"')
+                        except Exception:
+                            pass
+
+                # Preencher passageiros
                 pax_list = self.passengers if self.passengers else [_apply_defaults({})]
                 for i, pax in enumerate(pax_list):
-                    self._log(f'Passageiro {i+1}/{len(pax_list)}')
+                    self._log(f'-- Passageiro {i+1}/{len(pax_list)} --')
                     await self._fill_pax(page, pax)
                     await self._wait(2000)
 
@@ -321,27 +368,26 @@ class GolCheckinEngine:
                 except Exception:
                     pass
 
-                # Aguardar pagina de cartoes de embarque
+                # Aguardar cartoes de embarque
                 self._log('Aguardando cartoes de embarque...')
                 try:
                     await page.wait_for_url(
                         '**/cartao-de-embarque**',
-                        wait_until='domcontentloaded',
+                        wait_until='commit',
                         timeout=90000)
-                except Exception:
-                    self._log('Timeout aguardando cartao-de-embarque, verificando pagina...')
-                await self._wait(5000)
+                    self._log('Chegou na pagina de cartoes!')
+                except Exception as e:
+                    self._log(f'wait_for_url cartao: {e}')
 
-                # Verificar se chegou na pagina certa
-                current_url = page.url
-                self._log(f'URL atual: {current_url}')
+                await self._wait(5000)
+                self._log(f'URL final: {page.url}')
 
                 # Carregar html2canvas
                 self._log('Carregando html2canvas...')
                 await page.evaluate(JS_LOAD_H2C)
                 await self._wait(2000)
 
-                # Detectar passageiros nas abas
+                # Detectar passageiros
                 pax_tabs = await page.query_selector_all(
                     '.p-boarding-pass__details-item, [class*="passenger-tab"]')
                 n_pax = max(len(pax_tabs), 1)
@@ -381,18 +427,22 @@ class GolCheckinEngine:
                         fpath = self.job_dir / fname
                         fpath.write_bytes(png_bytes)
                         files.append(fname)
-                        self._log(f'  Salvo: {fname} ({len(png_bytes)//1024}KB)')
+                        self._log(f'Salvo: {fname} ({len(png_bytes)//1024}KB)')
 
                 JOBS[self.job_id]['status'] = 'done'
                 JOBS[self.job_id]['files']  = files
-                self._log(f'Concluido! {len(files)} cartoes salvos.')
+                self._log(f'=== CONCLUIDO! {len(files)} cartoes salvos ===')
 
             except Exception as e:
-                self._log(f'ERRO: {e}')
+                import traceback
+                tb = traceback.format_exc()
+                self._log(f'ERRO FATAL: {e}')
+                self._log(f'TRACEBACK: {tb[:500]}')
                 JOBS[self.job_id]['status'] = 'error'
                 JOBS[self.job_id]['error']  = str(e)
             finally:
                 await browser.close()
+                self._log('Browser fechado.')
 
 
 def _run_job(payload, job_id):
