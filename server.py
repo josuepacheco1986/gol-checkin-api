@@ -23,7 +23,7 @@ DEFAULT_BIRTHDATE = "01/01/1980"
 # ─── Script Playwright que roda em processo separado ──────────────────────────
 # Isto evita o conflito asyncio/gunicorn/threading
 PLAYWRIGHT_SCRIPT = """
-import asyncio, base64, io, json, os, re, sys, time, traceback
+import asyncio, base64, io, json, os, re, subprocess, sys, time, traceback
 from pathlib import Path
 from PIL import Image, ImageOps
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -39,6 +39,38 @@ def log(msg):
     ts = time.strftime('%H:%M:%S')
     line = f'[{ts}] {msg}'
     print(line, flush=True)
+
+def install_deps():
+    """Instala dependencias do sistema para Chromium no Ubuntu 24.04"""
+    log("Verificando dependencias do sistema...")
+    try:
+        subprocess.run(['apt-get','update','-qq'], capture_output=True, timeout=60)
+        pkgs = [
+            'libglib2.0-0','libnss3','libnspr4','libdbus-1-3',
+            'libatk1.0-0','libatk-bridge2.0-0','libcups2','libdrm2',
+            'libatspi2.0-0','libx11-6','libxcomposite1','libxdamage1',
+            'libxext6','libxfixes3','libxrandr2','libgbm1','libxcb1',
+            'libxkbcommon0','libpango-1.0-0','libcairo2'
+        ]
+        for alsa in ['libasound2t64', 'libasound2']:
+            r = subprocess.run(
+                ['apt-get','install','-y','--no-install-recommends', alsa],
+                capture_output=True, timeout=60,
+                env={**os.environ,'DEBIAN_FRONTEND':'noninteractive'})
+            if r.returncode == 0:
+                log(f"  ALSA instalado: {alsa}")
+                break
+        r2 = subprocess.run(
+            ['apt-get','install','-y','--no-install-recommends'] + pkgs,
+            capture_output=True, timeout=120,
+            env={**os.environ,'DEBIAN_FRONTEND':'noninteractive'})
+        if r2.returncode == 0:
+            log("  Dependencias instaladas!")
+        else:
+            log(f"  Aviso deps: {r2.stderr.decode()[:200]}")
+    except Exception as e:
+        log(f"  Aviso install_deps: {e}")
+
 
 JS_LOAD_H2C = \"\"\"async () => {
 if (typeof html2canvas !== 'undefined') return 'ok';
@@ -220,7 +252,10 @@ async def main():
         p.setdefault('birth_date', DEFAULT_BIRTHDATE)
         p.setdefault('prefer_no_emergency', True)
 
-    l('Iniciando Playwright...')
+    # Instalar dependencias do sistema antes de iniciar o Playwright
+    install_deps()
+
+        l('Iniciando Playwright...')
     async with async_playwright() as pw:
         l('Abrindo Chromium...')
         browser = await pw.chromium.launch(
