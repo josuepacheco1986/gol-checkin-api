@@ -45,16 +45,6 @@ backgroundColor: '#ffffff', logging: false
 return c.toDataURL('image/png');
 }"""
 
-JS_WAIT_PAX = """async (idx, ms) => {
-const t = Date.now();
-while (Date.now() - t < ms) {
-const it = document.querySelectorAll('.p-boarding-pass__details-item');
-if (it[idx] && it[idx].innerHTML.length > 200) return { ok: true };
-await new Promise(r => setTimeout(r, 300));
-}
-return { ok: false };
-}"""
-
 JS_CARD_COUNT = "() => document.querySelectorAll('.details-boarding-card').length"
 
 JS_CONTINUAR = """() => {
@@ -126,20 +116,20 @@ class GolCheckinEngine:
                     "button:has-text('Continuar'):not([disabled])",
                     state='visible', timeout=10_000)
                 await page.click("button:has-text('Continuar'):not([disabled])")
-                self._log(' -> Continuar')
-                await self._wait(1200)
+                self._log(' -> Continuar clicado')
+                await self._wait(1500)
                 return
             except Exception:
                 ok = await page.evaluate(JS_CONTINUAR)
                 if ok:
-                    self._log(' -> Continuar JS')
-                    await self._wait(1200)
+                    self._log(' -> Continuar via JS')
+                    await self._wait(1500)
                     return
             await self._wait(2000)
 
     async def _fill_pax(self, page, pax):
-        name = pax.get('first_name', '') + ' ' + pax.get('last_name', '')
-        self._log(f'Formulario: {name.strip() or "passageiro"}')
+        name = (pax.get('first_name', '') + ' ' + pax.get('last_name', '')).strip()
+        self._log(f'Preenchendo: {name or "passageiro"}')
         found = False
         try:
             btns = await page.query_selector_all('button, a')
@@ -148,13 +138,13 @@ class GolCheckinEngine:
                 if 'preencher dados' in txt or 'completar dados' in txt:
                     await btn.click()
                     found = True
-                    await self._wait(2000)
+                    await self._wait(2500)
                     break
         except Exception as e:
             self._log(f'  Aviso botao: {e}')
 
         if not found:
-            self._log('  Nenhum botao de preencher encontrado, continuando...')
+            self._log('  Sem botao de preencher, continuando...')
             return
 
         # Passo 1: dados pessoais
@@ -162,7 +152,7 @@ class GolCheckinEngine:
         try:
             await page.wait_for_selector(
                 'input[placeholder*="CPF"], input[name*="cpf"], input[id*="cpf"]',
-                timeout=8000)
+                timeout=10000)
             cpf_raw = re.sub(r'\D', '', pax.get('cpf', DEFAULT_CPF))
             cpf_fmt = f"{cpf_raw[:3]}.{cpf_raw[3:6]}.{cpf_raw[6:9]}-{cpf_raw[9:]}"
             cpf_field = await page.query_selector(
@@ -170,6 +160,7 @@ class GolCheckinEngine:
             if cpf_field:
                 await cpf_field.triple_click()
                 await cpf_field.type(cpf_fmt, delay=60)
+                self._log(f'  CPF preenchido')
         except Exception as e:
             self._log(f'  CPF erro: {e}')
 
@@ -226,7 +217,8 @@ class GolCheckinEngine:
         if pax.get('prefer_no_emergency', DEFAULT_PREFER_NO_EMERGENCY):
             try:
                 toggle = await page.query_selector(
-                    'label:has-text("emergencia"), label:has-text("emergência"), input[type="checkbox"]')
+                    'label:has-text("emergencia"), label:has-text("emergência"), '
+                    'input[type="checkbox"]')
                 if toggle:
                     await toggle.click()
                     await self._wait(500)
@@ -251,7 +243,8 @@ class GolCheckinEngine:
                 headless=True,
                 args=['--no-sandbox', '--disable-setuid-sandbox',
                       '--disable-blink-features=AutomationControlled',
-                      '--disable-dev-shm-usage', '--disable-gpu'])
+                      '--disable-dev-shm-usage', '--disable-gpu',
+                      '--disable-extensions'])
             ctx = await browser.new_context(
                 user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                             'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -260,9 +253,17 @@ class GolCheckinEngine:
                 locale='pt-BR')
             page = await ctx.new_page()
             try:
+                # ── Navegar para o site da GOL ──────────────────────────────
+                # IMPORTANTE: usar 'domcontentloaded' pois o site GOL (Angular + Akamai)
+                # nunca fica totalmente quieto na rede (networkidle travaria para sempre)
                 self._log('Acessando pagina de check-in...')
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-                await self._wait(3000)
+                try:
+                    await page.goto(url, wait_until='domcontentloaded', timeout=45000)
+                except PWTimeout:
+                    self._log('Timeout no goto, continuando mesmo assim...')
+                # Aguardar Angular renderizar (nao usar networkidle)
+                self._log('Aguardando Angular carregar...')
+                await self._wait(6000)
 
                 # Aceitar cookies
                 try:
@@ -270,24 +271,28 @@ class GolCheckinEngine:
                         "button:has-text('Aceitar'), button:has-text('Concordo')",
                         timeout=5000)
                     await self._wait(1000)
+                    self._log('Cookies aceitos')
                 except Exception:
                     pass
 
-                # Completar dados / iniciar
+                # Clicar em Completar dados / Iniciar check-in
+                self._log('Procurando botao de inicio...')
                 for sel in [
                     "button:has-text('Completar dados')",
                     "button:has-text('Iniciar check-in')",
                     "button:has-text('Continuar')"]:
                     try:
-                        await page.click(sel, timeout=5000)
+                        await page.click(sel, timeout=6000)
                         await self._wait(2000)
+                        self._log(f'Clicou: {sel}')
                         break
                     except Exception:
                         pass
 
                 # Preencher cada passageiro
                 pax_list = self.passengers if self.passengers else [_apply_defaults({})]
-                for pax in pax_list:
+                for i, pax in enumerate(pax_list):
+                    self._log(f'Passageiro {i+1}/{len(pax_list)}')
                     await self._fill_pax(page, pax)
                     await self._wait(2000)
 
@@ -303,55 +308,65 @@ class GolCheckinEngine:
                     pass
 
                 # Ancilares
-                self._log('Ancilares...')
+                self._log('Confirmando ancilares...')
                 try:
                     await self._click_continuar(page)
                 except Exception:
                     pass
 
                 # Assentos
-                self._log('Assentos...')
+                self._log('Confirmando assentos...')
                 try:
                     await self._click_continuar(page)
                 except Exception:
                     pass
 
-                # Aguardar cartoes de embarque
+                # Aguardar pagina de cartoes de embarque
                 self._log('Aguardando cartoes de embarque...')
                 try:
-                    await page.wait_for_url('**/cartao-de-embarque**', timeout=60000)
+                    await page.wait_for_url(
+                        '**/cartao-de-embarque**',
+                        wait_until='domcontentloaded',
+                        timeout=90000)
                 except Exception:
-                    pass
-                await self._wait(4000)
+                    self._log('Timeout aguardando cartao-de-embarque, verificando pagina...')
+                await self._wait(5000)
+
+                # Verificar se chegou na pagina certa
+                current_url = page.url
+                self._log(f'URL atual: {current_url}')
 
                 # Carregar html2canvas
+                self._log('Carregando html2canvas...')
                 await page.evaluate(JS_LOAD_H2C)
                 await self._wait(2000)
 
-                # Detectar passageiros
+                # Detectar passageiros nas abas
                 pax_tabs = await page.query_selector_all(
                     '.p-boarding-pass__details-item, [class*="passenger-tab"]')
                 n_pax = max(len(pax_tabs), 1)
-                self._log(f'Passageiros detectados: {n_pax}')
+                self._log(f'Abas de passageiros: {n_pax}')
 
                 card_count = await page.evaluate(JS_CARD_COUNT)
-                self._log(f'Cartoes por passageiro: {card_count}')
+                self._log(f'Cartoes detectados: {card_count}')
 
                 files = []
                 for pi in range(n_pax):
-                    if pi > 0 and pax_tabs:
+                    if pi > 0 and pi < len(pax_tabs):
                         try:
                             await pax_tabs[pi].click()
                             await self._wait(2000)
                         except Exception:
                             pass
 
-                    pax_name = 'PAX' + str(pi + 1)
+                    pax_name = f'PAX{pi+1}'
                     try:
-                        pax_els = await page.query_selector_all('.p-boarding-pass__details-item')
+                        pax_els = await page.query_selector_all(
+                            '.p-boarding-pass__details-item')
                         if pax_els and pi < len(pax_els):
                             nm = await pax_els[pi].inner_text()
-                            pax_name = re.sub(r'\s+', '_', nm.strip().split('\n')[0].upper())[:20]
+                            pax_name = re.sub(r'\s+', '_',
+                                nm.strip().split('\n')[0].upper())[:20]
                     except Exception:
                         pass
 
